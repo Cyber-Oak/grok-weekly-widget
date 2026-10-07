@@ -1,0 +1,704 @@
+#!/usr/bin/env python3
+"""Desktop widget for Grok weekly usage.
+
+It sits on the wallpaper like Conky: no title bar, under other windows,
+just above the taskbar. It is fixed there and starts with the session.
+
+Reads the grok CLI session in ~/.grok/auth.json (mode 0600) and calls the
+same billing endpoint the CLI's /usage view uses:
+
+    GET https://cli-chat-proxy.grok.com/v1/billing?format=credits
+
+Headers match the CLI: Authorization: Bearer, X-XAI-Token-Auth: xai-grok-cli,
+and x-userid when the login file has a user id. Refreshes every 10 minutes.
+"""
+
+from __future__ import annotations
+
+import base64
+import ctypes
+import ctypes.util
+import fcntl
+import json
+import os
+import queue
+import sys
+import threading
+import time
+import tkinter as tk
+import tkinter.font as tkfont
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
+
+BILLING_URL = "https://cli-chat-proxy.grok.com/v1/billing?format=credits"
+TOKEN_AUTH = "xai-grok-cli"
+EXPIRED_MSG = "token expired, run grok to refresh"
+REFRESH_MS = 10 * 60 * 1000
+RETRY_MS = 60 * 1000
+REQUEST_TIMEOUT = 20
+MAX_BODY = 1_000_000
+
+BG = "#1a1b1e"
+BORDER = "#3a3b42"
+FG = "#f4f4f5"
+FG_DIM = "#c4c4cc"
+TRACK = "#2e2f36"
+GREEN = "#3dd68c"
+AMBER = "#f5b942"
+RED = "#ff5d64"
+
+MONTHS = (
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+)
+
+
+class UsageError(Exception):
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self.message = message
+
+
+class Credentials:
+    def __init__(self, token: str, user_id: str | None, expired: bool) -> None:
+        self.token = token
+        self.user_id = user_id
+        self.expired = expired
+
+    def __repr__(self) -> str:
+        state = "expired" if self.expired else "active"
+        who = "set" if self.user_id else "missing"
+        return f"Credentials({state}, user_id={who})"
+
+
+class Usage:
+    def __init__(self, percent: float, resets_at: datetime | None) -> None:
+        self.percent = percent
+        self.resets_at = resets_at
+
+
+class Result:
+    def __init__(self, ok: bool, text: str, percent: float | None) -> None:
+        self.ok = ok
+        self.text = text
+        self.percent = percent
+
+
+def auth_file() -> str:
+    override = os.environ.get("GROK_AUTH_FILE")
+    if override:
+        return os.path.expanduser(override)
+    return os.path.expanduser("~/.grok/auth.json")
+
+
+def parse_time(value: object) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    # Keep the first six fractional digits so older Pythons accept the stamp.
+    dot = text.find(".")
+    if dot != -1:
+        end = dot + 1
+        while end < len(text) and text[end].isdigit():
+            end += 1
+        text = text[: dot + 1] + text[dot + 1 : end][:6] + text[end:]
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def header_value(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text or any(char in text for char in "\r\n\x00"):
+        return None
+    return text
+
+
+def as_percent(value: object) -> float | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value.strip().rstrip("%"))
+        except ValueError:
+            return None
+    if isinstance(value, dict):
+        for key in ("val", "percent", "usagePercent", "value"):
+            found = as_percent(value.get(key))
+            if found is not None:
+                return found
+    return None
+
+
+def jwt_parts(token: str) -> tuple[datetime | None, str | None]:
+    pieces = token.split(".")
+    if len(pieces) < 2:
+        return None, None
+    payload = pieces[1]
+    payload += "=" * (-len(payload) % 4)
+    try:
+        claims = json.loads(base64.urlsafe_b64decode(payload))
+    except (ValueError, TypeError):
+        return None, None
+    if not isinstance(claims, dict):
+        return None, None
+    exp = claims.get("exp")
+    expires = None
+    if isinstance(exp, (int, float)) and not isinstance(exp, bool):
+        try:
+            expires = datetime.fromtimestamp(exp, timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            expires = None
+    sub = claims.get("sub")
+    user_id = sub.strip() if isinstance(sub, str) else None
+    return expires, header_value(user_id) if user_id else None
+
+
+def iter_entries(data: object):
+    if isinstance(data, dict):
+        nested = [value for value in data.values() if isinstance(value, dict)]
+        keyed = [
+            entry
+            for entry in nested
+            if "key" in entry or "access_token" in entry
+        ]
+        if keyed:
+            yield from keyed
+            return
+        if "key" in data or "access_token" in data:
+            yield data
+        return
+    if isinstance(data, list):
+        for item in data:
+            if isinstance(item, dict):
+                yield item
+
+
+def load_credentials(path: str | None = None, now: datetime | None = None) -> Credentials:
+    path = path or auth_file()
+    try:
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+    except FileNotFoundError as exc:
+        raise UsageError("not signed in, run grok") from exc
+    except (OSError, json.JSONDecodeError, UnicodeError) as exc:
+        raise UsageError("can't read login, run grok") from exc
+
+    now = now or datetime.now(timezone.utc)
+    found = []
+    for entry in iter_entries(data):
+        token = header_value(entry.get("key")) or header_value(entry.get("access_token"))
+        if not token:
+            continue
+        jwt_exp, jwt_sub = jwt_parts(token)
+        expires = parse_time(entry.get("expires_at")) or jwt_exp
+        user_id = header_value(entry.get("user_id")) or jwt_sub
+        expired = expires is not None and expires <= now
+        found.append((expires or datetime.min.replace(tzinfo=timezone.utc), expired, token, user_id))
+    if not found:
+        raise UsageError("not signed in, run grok")
+
+    found.sort(key=lambda item: item[0], reverse=True)
+    for _expires, expired, token, user_id in found:
+        if not expired:
+            return Credentials(token, user_id, False)
+    _expires, _expired, token, user_id = found[0]
+    return Credentials(token, user_id, True)
+
+
+def message_for_status(code: int) -> str:
+    if code in (401, 403):
+        return EXPIRED_MSG
+    if code in (301, 302, 303, 307, 308):
+        return "usage endpoint moved"
+    return "usage unavailable"
+
+
+class _RefuseRedirect(urllib.request.HTTPRedirectHandler):
+    """Do not follow redirects. A redirect would copy the bearer token."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(req.full_url, code, msg, headers, fp)
+
+
+def http_get_billing(creds: Credentials, url: str = BILLING_URL, timeout: int = REQUEST_TIMEOUT) -> dict:
+    headers = {
+        "Authorization": "Bearer " + creds.token,
+        "X-XAI-Token-Auth": TOKEN_AUTH,
+        "Accept": "application/json",
+        "User-Agent": "grok-weekly-widget",
+    }
+    if creds.user_id:
+        headers["x-userid"] = creds.user_id
+    request = urllib.request.Request(url, headers=headers, method="GET")
+    opener = urllib.request.build_opener(_RefuseRedirect)
+    try:
+        with opener.open(request, timeout=timeout) as response:
+            raw = response.read(MAX_BODY + 1)
+    except urllib.error.HTTPError as exc:
+        raise UsageError(message_for_status(exc.code)) from exc
+    except Exception as exc:
+        raise UsageError("can't reach Grok") from exc
+    if len(raw) > MAX_BODY:
+        raise UsageError("usage data changed")
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise UsageError("usage data changed") from exc
+    if not isinstance(payload, dict):
+        raise UsageError("usage data changed")
+    return payload
+
+
+def _containers(payload: dict) -> list:
+    if not isinstance(payload, dict):
+        return []
+    found = []
+    config = payload.get("config")
+    if isinstance(config, dict):
+        found.append(config)
+    found.append(payload)
+    return found
+
+
+def find_percent(payload: dict) -> float | None:
+    containers = _containers(payload)
+    for container in containers:
+        percent = as_percent(container.get("creditUsagePercent"))
+        if percent is not None:
+            return percent
+    for container in containers:
+        for value in container.values():
+            if isinstance(value, dict):
+                percent = as_percent(value.get("creditUsagePercent"))
+                if percent is not None:
+                    return percent
+    return None
+
+
+def find_reset(payload: dict) -> datetime | None:
+    for container in _containers(payload):
+        period = container.get("currentPeriod")
+        if isinstance(period, dict):
+            resets = parse_time(period.get("end"))
+            if resets is not None:
+                return resets
+        for key in ("billingPeriodEnd", "periodEnd", "resetsAt", "resetAt"):
+            resets = parse_time(container.get(key))
+            if resets is not None:
+                return resets
+    return None
+
+
+def extract_usage(payload: dict) -> Usage:
+    percent = find_percent(payload)
+    if percent is None:
+        raise UsageError("usage data changed")
+    return Usage(percent, find_reset(payload))
+
+
+def format_percent(value: float) -> str:
+    rounded = round(float(value), 1)
+    if abs(rounded - round(rounded)) < 1e-9:
+        return str(int(round(rounded)))
+    return f"{rounded:.1f}"
+
+
+def format_line(percent: float, resets_at: datetime | None) -> str:
+    shown = format_percent(percent)
+    if resets_at is None:
+        return f"Grok {shown}% — reset unknown"
+    local = resets_at.astimezone()
+    when = f"{MONTHS[local.month - 1]} {local.day}"
+    return f"Grok {shown}% — resets {when}"
+
+
+def fetch_usage() -> Usage:
+    creds = load_credentials()
+    if creds.expired:
+        raise UsageError(EXPIRED_MSG)
+    return extract_usage(http_get_billing(creds))
+
+
+def read_usage() -> Result:
+    try:
+        usage = fetch_usage()
+    except UsageError as exc:
+        return Result(False, exc.message, None)
+    except Exception:
+        return Result(False, "usage unavailable", None)
+    return Result(True, format_line(usage.percent, usage.resets_at), usage.percent)
+
+
+def bar_color(percent: float) -> str:
+    if percent >= 90:
+        return RED
+    if percent >= 70:
+        return AMBER
+    return GREEN
+
+
+def pick_family(root: tk.Misc) -> str:
+    families = set(tkfont.families(root))
+    for name in ("Nunito Sans", "Nunito", "DejaVu Sans", "Liberation Sans"):
+        if name in families:
+            return name
+    return tkfont.nametofont("TkDefaultFont").cget("family")
+
+
+def _x_cardinals(x11, display, window: int, name: str):
+    """Read a 32-bit X property as a list of ints. Caller owns the display."""
+    atom = x11.XInternAtom(display, name.encode(), False)
+    actual_type = ctypes.c_ulong()
+    actual_format = ctypes.c_int()
+    count = ctypes.c_ulong()
+    leftover = ctypes.c_ulong()
+    raw = ctypes.c_void_p()
+    status = x11.XGetWindowProperty(
+        display, window, atom, 0, 64, False, 0,
+        ctypes.byref(actual_type), ctypes.byref(actual_format),
+        ctypes.byref(count), ctypes.byref(leftover), ctypes.byref(raw),
+    )
+    if status != 0 or not raw or count.value == 0 or actual_format.value != 32:
+        if raw:
+            x11.XFree(raw)
+        return None
+    data = ctypes.cast(raw, ctypes.POINTER(ctypes.c_ulong))
+    values = [int(data[index]) for index in range(count.value)]
+    x11.XFree(raw)
+    return values
+
+
+def bottom_taskbar(screen_w: int, screen_h: int):
+    """Return (x, y, width, height) of the widest bottom panel, or None.
+
+    Uses the EWMH strut the panel reserves, so a taskbar on one monitor
+    of a wider desktop is not treated as spanning every screen.
+    """
+    libname = ctypes.util.find_library("X11")
+    if not libname:
+        return None
+    try:
+        x11 = ctypes.CDLL(libname)
+    except OSError:
+        return None
+    x11.XOpenDisplay.restype = ctypes.c_void_p
+    x11.XDefaultRootWindow.restype = ctypes.c_ulong
+    x11.XInternAtom.restype = ctypes.c_ulong
+    x11.XFree.argtypes = [ctypes.c_void_p]
+    x11.XGetWindowProperty.argtypes = [
+        ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong,
+        ctypes.c_long, ctypes.c_long, ctypes.c_int, ctypes.c_ulong,
+        ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(ctypes.c_int),
+        ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(ctypes.c_ulong),
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    display = x11.XOpenDisplay(None)
+    if not display:
+        return None
+    try:
+        root = x11.XDefaultRootWindow(display)
+        clients = _x_cardinals(x11, display, root, "_NET_CLIENT_LIST") or []
+        best = None
+        for window in clients:
+            strut = _x_cardinals(x11, display, window, "_NET_WM_STRUT_PARTIAL")
+            if not strut or len(strut) < 12 or strut[3] <= 0:
+                continue
+            start_x = strut[10]
+            end_x = strut[11]
+            if end_x < start_x:
+                continue
+            rect = (start_x, screen_h - int(strut[3]), end_x - start_x + 1, int(strut[3]))
+            if rect[2] <= 0 or rect[1] < 0 or rect[1] > screen_h:
+                continue
+            if best is None or rect[2] > best[2]:
+                best = rect
+        if best is None:
+            return None
+        # Ignore a strut that does not actually sit on this screen.
+        if best[0] >= screen_w or best[1] >= screen_h:
+            return None
+        return best
+    except Exception:
+        return None
+    finally:
+        x11.XCloseDisplay(display)
+
+
+def _x_change(x11, display, window: int, prop: str, prop_type: int, data, count: int) -> None:
+    atom = x11.XInternAtom(display, prop.encode(), False)
+    x11.XChangeProperty(
+        display, window, atom, prop_type, 32, 0,
+        ctypes.cast(data, ctypes.POINTER(ctypes.c_ubyte)), count,
+    )
+
+
+def pin_to_desktop(window_id: int) -> None:
+    """Make this toplevel behave like Conky.
+
+    Hints have to be set on Tk's outer window (the parent of winfo_id),
+    which is the one Openbox manages. Type "desktop" sinks under the
+    wallpaper on this session, so the window stays a normal undecorated
+    window with the below state.
+    """
+    libname = ctypes.util.find_library("X11")
+    if not libname:
+        return
+    try:
+        x11 = ctypes.CDLL(libname)
+    except OSError:
+        return
+    x11.XOpenDisplay.restype = ctypes.c_void_p
+    x11.XDefaultRootWindow.restype = ctypes.c_ulong
+    x11.XInternAtom.restype = ctypes.c_ulong
+    x11.XQueryTree.restype = ctypes.c_int
+    x11.XQueryTree.argtypes = [
+        ctypes.c_void_p, ctypes.c_ulong,
+        ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(ctypes.c_ulong),
+        ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_uint),
+    ]
+    display = x11.XOpenDisplay(None)
+    if not display:
+        return
+    try:
+        root = x11.XDefaultRootWindow(display)
+        targets = [int(window_id)]
+        parent = ctypes.c_ulong()
+        root_ret = ctypes.c_ulong()
+        children = ctypes.c_void_p()
+        count = ctypes.c_uint()
+        if x11.XQueryTree(
+            display, int(window_id),
+            ctypes.byref(root_ret), ctypes.byref(parent),
+            ctypes.byref(children), ctypes.byref(count),
+        ):
+            if children:
+                x11.XFree(children)
+            parent_id = int(parent.value)
+            if parent_id and parent_id not in (int(root), int(window_id)):
+                targets.append(parent_id)
+
+        class MotifHints(ctypes.Structure):
+            _fields_ = [
+                ("flags", ctypes.c_ulong),
+                ("functions", ctypes.c_ulong),
+                ("decorations", ctypes.c_ulong),
+                ("input_mode", ctypes.c_long),
+                ("status", ctypes.c_ulong),
+            ]
+
+        hints = MotifHints(2, 0, 0, 0, 0)
+        states = (ctypes.c_ulong * 4)(*(
+            x11.XInternAtom(display, name.encode(), False)
+            for name in (
+                "_NET_WM_STATE_BELOW",
+                "_NET_WM_STATE_SKIP_TASKBAR",
+                "_NET_WM_STATE_SKIP_PAGER",
+                "_NET_WM_STATE_STICKY",
+            )
+        ))
+        normal = (ctypes.c_ulong * 1)(x11.XInternAtom(display, "_NET_WM_WINDOW_TYPE_NORMAL".encode(), False))
+        xa_atom = 4
+        motif = x11.XInternAtom(display, "_MOTIF_WM_HINTS".encode(), False)
+        for target in targets:
+            _x_change(x11, display, target, "_MOTIF_WM_HINTS", motif, ctypes.byref(hints), 5)
+            _x_change(x11, display, target, "_NET_WM_STATE", xa_atom, states, 4)
+            _x_change(x11, display, target, "_NET_WM_WINDOW_TYPE", xa_atom, normal, 1)
+        x11.XFlush(display)
+    except Exception:
+        return
+    finally:
+        x11.XCloseDisplay(display)
+
+
+class UsageWidget(tk.Tk):
+    def __init__(self) -> None:
+        super().__init__()
+        self.title("Grok usage")
+        self.configure(bg=BORDER)
+        self.resizable(False, False)
+
+        self._percent: float | None = None
+        self._queue: queue.Queue = queue.Queue()
+        self._lock = threading.Lock()
+        self._alive = True
+        self._timer: str | None = None
+
+        family = pick_family(self)
+        self._font = tkfont.Font(family=family, size=12)
+
+        outer = tk.Frame(self, bg=BORDER, padx=1, pady=1)
+        outer.pack(fill="both", expand=True)
+        inner = tk.Frame(outer, bg=BG, padx=12, pady=8)
+        inner.pack(fill="both", expand=True)
+
+        row = tk.Frame(inner, bg=BG)
+        row.pack(fill="x")
+        self.label = tk.Label(
+            row,
+            text="Grok …",
+            bg=BG,
+            fg=FG,
+            font=self._font,
+            anchor="w",
+            justify="left",
+        )
+        self.label.pack(side="left", fill="x", expand=True)
+        self.bar = tk.Canvas(
+            inner,
+            width=10,
+            height=8,
+            bg=BG,
+            highlightthickness=0,
+            bd=0,
+        )
+        self.bar.pack(fill="x", pady=(8, 0))
+
+        # Canvas defaults to about 10 cm wide, which would blow the window out.
+        # Size it from the longest status line instead.
+        text_w = max(
+            self._font.measure(EXPIRED_MSG),
+            self._font.measure("Grok 100% — resets Sep 30"),
+        ) + 8
+        self.label.configure(wraplength=text_w)
+        self.update_idletasks()
+        width = text_w + 12 * 2 + 2
+        height = max(self.winfo_reqheight(), 52)
+        self._place(width, height)
+        pin_to_desktop(self.winfo_id())
+
+        self.bar.bind("<Configure>", lambda _event: self._draw_bar())
+        # No title bar, so there is no close button. Ignore a delete
+        # request so a window manager cannot dismiss it by accident.
+        self.protocol("WM_DELETE_WINDOW", lambda: None)
+
+        self.refresh_now()
+        self._arm_timer()
+        self.after(150, self._poll)
+        self.after(400, lambda: pin_to_desktop(self.winfo_id()))
+
+    def _place(self, width: int, height: int) -> None:
+        screen_w = self.winfo_screenwidth()
+        screen_h = self.winfo_screenheight()
+        x, y = self._above_taskbar(width, height, screen_w, screen_h)
+        self.geometry(f"{width}x{height}+{x}+{y}")
+
+    @staticmethod
+    def _above_taskbar(width: int, height: int, screen_w: int, screen_h: int) -> tuple[int, int]:
+        panel = bottom_taskbar(screen_w, screen_h)
+        deadline = time.time() + 12
+        while panel is None and time.time() < deadline:
+            time.sleep(0.4)
+            panel = bottom_taskbar(screen_w, screen_h)
+        if panel:
+            panel_x, panel_y, panel_w, _panel_h = panel
+            x = panel_x + panel_w - width - 10
+            y = panel_y - height
+            x = min(max(x, panel_x), max(panel_x, panel_x + panel_w - width))
+            return max(0, x), max(0, y)
+        return max(0, screen_w - width - 16), max(0, screen_h - height - 8)
+
+    def _arm_timer(self, delay_ms: int = REFRESH_MS) -> None:
+        if not self._alive:
+            return
+        if self._timer is not None:
+            self.after_cancel(self._timer)
+            self._timer = None
+        self._timer = self.after(delay_ms, self._on_timer)
+
+    def _on_timer(self) -> None:
+        self._timer = None
+        self.refresh_now()
+        self._arm_timer()
+
+    def refresh_now(self) -> None:
+        if not self._alive:
+            return
+        if not self._lock.acquire(blocking=False):
+            return
+        threading.Thread(target=self._worker, daemon=True).start()
+
+    def _worker(self) -> None:
+        try:
+            self._queue.put(read_usage())
+        finally:
+            self._lock.release()
+
+    def _poll(self) -> None:
+        if not self._alive:
+            return
+        latest = None
+        try:
+            while True:
+                latest = self._queue.get_nowait()
+        except queue.Empty:
+            pass
+        if latest is not None:
+            self.apply(latest)
+        self.after(200, self._poll)
+
+    def apply(self, result: Result) -> None:
+        text = result.text if isinstance(result.text, str) and result.text else "usage unavailable"
+        percent = result.percent if isinstance(result.percent, (int, float)) and not isinstance(result.percent, bool) else None
+        self._percent = float(percent) if percent is not None else None
+        self.label.configure(text=text, fg=FG if result.ok else "#ffd0cc")
+        self._draw_bar()
+        # A fresh login does not restart the widget. Recheck quickly until it works.
+        if not result.ok:
+            self._arm_timer(RETRY_MS)
+
+    def _draw_bar(self) -> None:
+        width = self.bar.winfo_width()
+        height = self.bar.winfo_height()
+        if width < 2 or height < 2:
+            return
+        self.bar.delete("all")
+        self.bar.create_rectangle(0, 0, width, height, fill=TRACK, width=0)
+        if self._percent is None:
+            return
+        fraction = max(0.0, min(self._percent, 100.0)) / 100.0
+        fill = int(round(width * fraction))
+        if fill > 0:
+            self.bar.create_rectangle(0, 0, fill, height, fill=bar_color(self._percent), width=0)
+
+def main(argv: list[str] | None = None) -> int:
+    args = list(sys.argv[1:] if argv is None else argv)
+    if args == ["--once"]:
+        result = read_usage()
+        print(result.text)
+        return 0 if result.ok else 1
+    if args:
+        print("usage: grok-weekly-widget [--once]", file=sys.stderr)
+        return 2
+    os.makedirs(os.path.expanduser("~/.cache"), mode=0o700, exist_ok=True)
+    lock_path = os.path.expanduser("~/.cache/grok-weekly-widget.lock")
+    lock_file = open(lock_path, "a", encoding="utf-8")
+    try:
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print("grok-weekly-widget is already running", file=sys.stderr)
+        return 0
+    try:
+        widget = UsageWidget()
+    except tk.TclError as exc:
+        print(f"can't open a window: {exc}", file=sys.stderr)
+        return 1
+    widget.mainloop()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
