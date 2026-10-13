@@ -38,6 +38,7 @@ from datetime import datetime, timedelta, timezone
 
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
+# Claude Code's public OAuth app ID (a client identifier, not a secret).
 CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 OAUTH_BETA = "oauth-2025-04-20"
 API_VERSION = "2023-06-01"
@@ -467,7 +468,7 @@ def exchange_refresh(creds: Credentials, now_ms: int) -> Credentials:
         now_ms + int(refresh_in * 1000) if refresh_in and refresh_in > 0 else creds.refresh_expires_ms
     )
     scope_text = payload.get("scope")
-    new_scopes = CUn(scope_text) if isinstance(scope_text, str) else creds.scopes
+    new_scopes = split_scopes(scope_text) if isinstance(scope_text, str) else creds.scopes
     minted = Credentials(
         access,
         refresh,
@@ -482,7 +483,7 @@ def exchange_refresh(creds: Credentials, now_ms: int) -> Credentials:
     return minted
 
 
-def CUn(scope: str) -> list[str]:
+def split_scopes(scope: str) -> list[str]:
     return [part for part in scope.split(" ") if part]
 
 
