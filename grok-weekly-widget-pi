@@ -4,8 +4,10 @@
 It sits on the wallpaper like Conky: no title bar, under other windows,
 just above the taskbar. It is fixed there and starts with the session.
 
-Reads the grok CLI session in ~/.grok/auth.json (mode 0600) and calls the
-same billing endpoint the CLI's /usage view uses:
+Reads the grok CLI session in ~/.grok/auth.json (mode 0600). An expired
+access token is renewed with the stored refresh token, under the same
+auth.json.lock the CLI uses, and the new session is written back. It then
+calls the billing endpoint the CLI's /usage view uses:
 
     GET https://cli-chat-proxy.grok.com/v1/billing?format=credits
 
@@ -16,6 +18,7 @@ and x-userid when the login file has a user id. Refreshes every 10 minutes.
 from __future__ import annotations
 
 import base64
+import contextlib
 import ctypes
 import ctypes.util
 import fcntl
@@ -23,27 +26,44 @@ import json
 import os
 import queue
 import sys
+import tempfile
 import threading
 import time
 import tkinter as tk
 import tkinter.font as tkfont
 import urllib.error
+import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 BILLING_URL = "https://cli-chat-proxy.grok.com/v1/billing?format=credits"
+CHANGED_MSG = "usage data changed"
 TOKEN_AUTH = "xai-grok-cli"
 EXPIRED_MSG = "token expired, run grok to refresh"
 REFRESH_MS = 10 * 60 * 1000
 RETRY_MS = 60 * 1000
 REQUEST_TIMEOUT = 20
 MAX_BODY = 1_000_000
+PLACE_MS = 15 * 1000
 
-BG = "#1a1b1e"
-BORDER = "#3a3b42"
+# Card geometry is shared with claude-usage-widget so the two stack as one
+# column: same width and right edge, a small gap above the taskbar.
+CARD_W = 261
+EDGE_GAP = 5
+PANEL_GAP = 6
+PAD_X = 12
+PAD_Y = 9
+BAR_H = 6
+ALPHA = 0.94
+
+BG = "#16171a"
+BORDER = "#2c2d33"
 FG = "#f4f4f5"
-FG_DIM = "#c4c4cc"
-TRACK = "#2e2f36"
+FG_DIM = "#b4b4bd"
+FG_MUTED = "#7c7c87"
+ERROR_FG = "#ffd0cc"
+TRACK = "#2a2b31"
+ACCENT = "#9fb4ff"
 GREEN = "#3dd68c"
 AMBER = "#f5b942"
 RED = "#ff5d64"
@@ -61,15 +81,31 @@ class UsageError(Exception):
 
 
 class Credentials:
-    def __init__(self, token: str, user_id: str | None, expired: bool) -> None:
+    def __init__(
+        self,
+        token: str,
+        user_id: str | None,
+        expired: bool,
+        refresh_token: str | None = None,
+        issuer: str | None = None,
+        client_id: str | None = None,
+        entry_key: str | int | None = None,
+        expires: datetime | None = None,
+    ) -> None:
         self.token = token
         self.user_id = user_id
         self.expired = expired
+        self.refresh_token = refresh_token
+        self.issuer = issuer
+        self.client_id = client_id
+        self.entry_key = entry_key
+        self.expires = expires
 
     def __repr__(self) -> str:
         state = "expired" if self.expired else "active"
         who = "set" if self.user_id else "missing"
-        return f"Credentials({state}, user_id={who})"
+        refresh = "set" if self.refresh_token else "missing"
+        return f"Credentials({state}, user_id={who}, refresh_token={refresh})"
 
 
 class Usage:
@@ -79,10 +115,13 @@ class Usage:
 
 
 class Result:
-    def __init__(self, ok: bool, text: str, percent: float | None) -> None:
+    def __init__(
+        self, ok: bool, text: str, percent: float | None, resets_at: datetime | None = None,
+    ) -> None:
         self.ok = ok
         self.text = text
         self.percent = percent
+        self.resets_at = resets_at
 
 
 def auth_file() -> str:
@@ -167,24 +206,44 @@ def jwt_parts(token: str) -> tuple[datetime | None, str | None]:
     return expires, header_value(user_id) if user_id else None
 
 
+def early_secs() -> int:
+    raw = os.environ.get("GROK_AUTH_EARLY_INVALIDATION_SECS", "300")
+    try:
+        value = int(str(raw).strip())
+    except ValueError:
+        return 300
+    return value if value > 0 else 0
+
+
+def token_needs_refresh(expires: datetime | None, now: datetime) -> bool:
+    if expires is None:
+        return False
+    return expires <= now + timedelta(seconds=early_secs())
+
+
 def iter_entries(data: object):
+    """Yield (storage key, entry) for each credential record."""
     if isinstance(data, dict):
-        nested = [value for value in data.values() if isinstance(value, dict)]
+        nested = [
+            (key, value)
+            for key, value in data.items()
+            if isinstance(value, dict)
+        ]
         keyed = [
-            entry
-            for entry in nested
-            if "key" in entry or "access_token" in entry
+            (key, entry)
+            for key, entry in nested
+            if "key" in entry or "access_token" in entry or "refresh_token" in entry
         ]
         if keyed:
             yield from keyed
             return
-        if "key" in data or "access_token" in data:
-            yield data
+        if "key" in data or "access_token" in data or "refresh_token" in data:
+            yield None, data
         return
     if isinstance(data, list):
-        for item in data:
+        for index, item in enumerate(data):
             if isinstance(item, dict):
-                yield item
+                yield index, item
 
 
 def load_credentials(path: str | None = None, now: datetime | None = None) -> Credentials:
@@ -199,24 +258,39 @@ def load_credentials(path: str | None = None, now: datetime | None = None) -> Cr
 
     now = now or datetime.now(timezone.utc)
     found = []
-    for entry in iter_entries(data):
+    for entry_key, entry in iter_entries(data):
         token = header_value(entry.get("key")) or header_value(entry.get("access_token"))
-        if not token:
+        refresh = header_value(entry.get("refresh_token"))
+        if not token and not refresh:
             continue
-        jwt_exp, jwt_sub = jwt_parts(token)
+        jwt_exp, jwt_sub = jwt_parts(token) if token else (None, None)
         expires = parse_time(entry.get("expires_at")) or jwt_exp
         user_id = header_value(entry.get("user_id")) or jwt_sub
-        expired = expires is not None and expires <= now
-        found.append((expires or datetime.min.replace(tzinfo=timezone.utc), expired, token, user_id))
+        issuer = header_value(entry.get("oidc_issuer"))
+        client_id = header_value(entry.get("oidc_client_id"))
+        expired = (not token) or token_needs_refresh(expires, now)
+        creds = Credentials(
+            token or "",
+            user_id,
+            expired,
+            refresh,
+            issuer,
+            client_id,
+            entry_key,
+            expires,
+        )
+        found.append((expires or datetime.min.replace(tzinfo=timezone.utc), creds))
     if not found:
         raise UsageError("not signed in, run grok")
 
     found.sort(key=lambda item: item[0], reverse=True)
-    for _expires, expired, token, user_id in found:
-        if not expired:
-            return Credentials(token, user_id, False)
-    _expires, _expired, token, user_id = found[0]
-    return Credentials(token, user_id, True)
+    for _when, creds in found:
+        if creds.token and not creds.expired:
+            return creds
+    for _when, creds in found:
+        if creds.refresh_token and creds.issuer and creds.client_id:
+            return creds
+    return found[0][1]
 
 
 def message_for_status(code: int) -> str:
@@ -234,7 +308,233 @@ class _RefuseRedirect(urllib.request.HTTPRedirectHandler):
         raise urllib.error.HTTPError(req.full_url, code, msg, headers, fp)
 
 
-def http_get_billing(creds: Credentials, url: str = BILLING_URL, timeout: int = REQUEST_TIMEOUT) -> dict:
+def allowed_url(value: str) -> str:
+    """https, or http on loopback so a local test server can stand in."""
+    text = value.strip()
+    parsed = urllib.parse.urlparse(text)
+    host = (parsed.hostname or "").lower()
+    loopback = host in {"localhost", "127.0.0.1", "::1"}
+    if parsed.username or parsed.password or not parsed.netloc:
+        raise UsageError("can't reach Grok")
+    if parsed.scheme == "https" or (parsed.scheme == "http" and loopback):
+        return text
+    raise UsageError("can't reach Grok")
+
+
+def _read_json(response) -> dict:
+    raw = response.read(MAX_BODY + 1)
+    if len(raw) > MAX_BODY:
+        raise UsageError("can't reach Grok")
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise UsageError("can't reach Grok") from exc
+    if not isinstance(payload, dict):
+        raise UsageError("can't reach Grok")
+    return payload
+
+
+def http_json(url: str, timeout: int = REQUEST_TIMEOUT) -> dict:
+    request = urllib.request.Request(
+        allowed_url(url),
+        headers={"Accept": "application/json", "User-Agent": "grok-weekly-widget"},
+        method="GET",
+    )
+    opener = urllib.request.build_opener(_RefuseRedirect)
+    try:
+        with opener.open(request, timeout=timeout) as response:
+            return _read_json(response)
+    except UsageError:
+        raise
+    except Exception as exc:
+        raise UsageError("can't reach Grok") from exc
+
+
+def oauth_error_message(raw: bytes) -> str:
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError):
+        return "can't reach Grok"
+    if not isinstance(payload, dict):
+        return "can't reach Grok"
+    # These mean the refresh token itself is dead. Anything else is retried.
+    if payload.get("error") in {
+        "invalid_grant",
+        "invalid_client",
+        "unauthorized_client",
+        "invalid_token",
+        "access_denied",
+    }:
+        return EXPIRED_MSG
+    return "can't reach Grok"
+
+
+def format_stamp(when: datetime) -> str:
+    when = when.astimezone(timezone.utc)
+    return when.strftime("%Y-%m-%dT%H:%M:%S.") + f"{when.microsecond:06d}000Z"
+
+
+def expiry_from(access_token: str, expires_in: object, now: datetime) -> datetime:
+    jwt_exp, _user = jwt_parts(access_token)
+    if jwt_exp is not None:
+        return jwt_exp
+    if isinstance(expires_in, (int, float)) and not isinstance(expires_in, bool) and expires_in > 0:
+        return now + timedelta(seconds=float(expires_in))
+    return now + timedelta(hours=1)
+
+
+def exchange_refresh(creds: Credentials, now: datetime | None = None) -> Credentials:
+    """Mint a new access token. The refresh token stays in the POST body."""
+    now = now or datetime.now(timezone.utc)
+    if not creds.issuer or not creds.client_id or not creds.refresh_token:
+        raise UsageError(EXPIRED_MSG)
+    document = http_json(creds.issuer.rstrip("/") + "/.well-known/openid-configuration")
+    endpoint = document.get("token_endpoint")
+    if not isinstance(endpoint, str) or not endpoint.strip():
+        raise UsageError("can't reach Grok")
+    form = urllib.parse.urlencode(
+        {
+            "grant_type": "refresh_token",
+            "refresh_token": creds.refresh_token,
+            "client_id": creds.client_id,
+        }
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        allowed_url(endpoint),
+        data=form,
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json",
+            "User-Agent": "grok-weekly-widget",
+        },
+        method="POST",
+    )
+    opener = urllib.request.build_opener(_RefuseRedirect)
+    try:
+        with opener.open(request, timeout=REQUEST_TIMEOUT) as response:
+            payload = _read_json(response)
+    except urllib.error.HTTPError as exc:
+        body = exc.read(MAX_BODY + 1) if exc.fp else b""
+        raise UsageError(oauth_error_message(body)) from exc
+    except UsageError:
+        raise
+    except Exception as exc:
+        raise UsageError("can't reach Grok") from exc
+    access = header_value(payload.get("access_token"))
+    if not access:
+        raise UsageError(EXPIRED_MSG)
+    refresh = header_value(payload.get("refresh_token")) or creds.refresh_token
+    expires = expiry_from(access, payload.get("expires_in"), now)
+    return Credentials(
+        access,
+        creds.user_id,
+        token_needs_refresh(expires, now),
+        refresh,
+        creds.issuer,
+        creds.client_id,
+        creds.entry_key,
+        expires,
+    )
+
+
+@contextlib.contextmanager
+def auth_lock(path: str):
+    """Serialize with the CLI. A rotated refresh token can only be used once."""
+    handle = open(path + ".lock", "a+", encoding="utf-8")
+    try:
+        deadline = time.monotonic() + 15
+        while True:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise UsageError("usage unavailable")
+                time.sleep(0.2)
+        yield
+    finally:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        handle.close()
+
+
+def atomic_write_json(path: str, data: object) -> None:
+    directory = os.path.dirname(path) or "."
+    fd, tmp = tempfile.mkstemp(prefix=".auth-", suffix=".tmp", dir=directory)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
+def save_session(path: str, entry_key, creds: Credentials, now: datetime | None = None) -> None:
+    now = now or datetime.now(timezone.utc)
+    try:
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, json.JSONDecodeError, UnicodeError) as exc:
+        raise UsageError("can't read login, run grok") from exc
+    entry = None
+    if isinstance(data, dict) and isinstance(entry_key, str) and isinstance(data.get(entry_key), dict):
+        entry = data[entry_key]
+    elif (
+        isinstance(data, list)
+        and isinstance(entry_key, int)
+        and 0 <= entry_key < len(data)
+        and isinstance(data[entry_key], dict)
+    ):
+        entry = data[entry_key]
+    if entry is None:
+        raise UsageError("can't read login, run grok")
+    entry["key"] = creds.token
+    if "access_token" in entry:
+        entry["access_token"] = creds.token
+    if creds.refresh_token:
+        entry["refresh_token"] = creds.refresh_token
+    entry["expires_at"] = format_stamp(creds.expires or (now + timedelta(hours=1)))
+    entry["create_time"] = format_stamp(now)
+    try:
+        atomic_write_json(path, data)
+    except OSError as exc:
+        raise UsageError("can't read login, run grok") from exc
+
+
+def refresh_session(failed: Credentials, force: bool = False) -> Credentials:
+    path = auth_file()
+    with auth_lock(path):
+        # Re-read under the lock. The CLI may have renewed the session while we waited.
+        current = load_credentials(path)
+        if current.token and current.token != failed.token and not current.expired:
+            return current
+        if not force and current.token and not current.expired:
+            return current
+        if not current.refresh_token or not current.issuer or not current.client_id:
+            raise UsageError(EXPIRED_MSG)
+        minted = exchange_refresh(current)
+        minted.entry_key = current.entry_key
+        save_session(path, current.entry_key, minted)
+        return minted
+
+
+def http_get_billing(creds: Credentials, url: str | None = None, timeout: int = REQUEST_TIMEOUT) -> dict:
+    url = url or BILLING_URL
     headers = {
         "Authorization": "Bearer " + creds.token,
         "X-XAI-Token-Auth": TOKEN_AUTH,
@@ -253,13 +553,13 @@ def http_get_billing(creds: Credentials, url: str = BILLING_URL, timeout: int = 
     except Exception as exc:
         raise UsageError("can't reach Grok") from exc
     if len(raw) > MAX_BODY:
-        raise UsageError("usage data changed")
+        raise UsageError(CHANGED_MSG)
     try:
         payload = json.loads(raw.decode("utf-8"))
     except (UnicodeError, json.JSONDecodeError) as exc:
-        raise UsageError("usage data changed") from exc
+        raise UsageError(CHANGED_MSG) from exc
     if not isinstance(payload, dict):
-        raise UsageError("usage data changed")
+        raise UsageError(CHANGED_MSG)
     return payload
 
 
@@ -286,7 +586,38 @@ def find_percent(payload: dict) -> float | None:
                 percent = as_percent(value.get("creditUsagePercent"))
                 if percent is not None:
                     return percent
+    # productUsage entries are shares of the same weekly pool.
+    total = 0.0
+    found_product = False
+    for container in containers:
+        products = container.get("productUsage")
+        if not isinstance(products, list):
+            continue
+        for item in products:
+            if not isinstance(item, dict):
+                continue
+            percent = as_percent(item.get("usagePercent"))
+            if percent is None:
+                continue
+            total += percent
+            found_product = True
+    if found_product:
+        return total
+    # A weekly period with no percent is an empty pool. Proto omits the 0.
+    if _weekly_period(payload):
+        return 0.0
     return None
+
+
+def _weekly_period(payload: dict) -> bool:
+    for container in _containers(payload):
+        period = container.get("currentPeriod")
+        if not isinstance(period, dict):
+            continue
+        kind = period.get("type")
+        if isinstance(kind, str) and "WEEKLY" in kind:
+            return True
+    return False
 
 
 def find_reset(payload: dict) -> datetime | None:
@@ -306,7 +637,7 @@ def find_reset(payload: dict) -> datetime | None:
 def extract_usage(payload: dict) -> Usage:
     percent = find_percent(payload)
     if percent is None:
-        raise UsageError("usage data changed")
+        raise UsageError(CHANGED_MSG)
     return Usage(percent, find_reset(payload))
 
 
@@ -315,6 +646,13 @@ def format_percent(value: float) -> str:
     if abs(rounded - round(rounded)) < 1e-9:
         return str(int(round(rounded)))
     return f"{rounded:.1f}"
+
+
+def format_reset(resets_at: datetime | None) -> str:
+    if resets_at is None:
+        return ""
+    local = resets_at.astimezone()
+    return f"resets {MONTHS[local.month - 1]} {local.day}"
 
 
 def format_line(percent: float, resets_at: datetime | None) -> str:
@@ -328,9 +666,18 @@ def format_line(percent: float, resets_at: datetime | None) -> str:
 
 def fetch_usage() -> Usage:
     creds = load_credentials()
-    if creds.expired:
-        raise UsageError(EXPIRED_MSG)
-    return extract_usage(http_get_billing(creds))
+    refreshed = False
+    if creds.expired or not creds.token:
+        creds = refresh_session(creds)
+        refreshed = True
+    try:
+        return extract_usage(http_get_billing(creds))
+    except UsageError as exc:
+        # One silent refresh after a rejection. A second rejection is shown.
+        if exc.message != EXPIRED_MSG or refreshed:
+            raise
+        creds = refresh_session(creds, force=True)
+        return extract_usage(http_get_billing(creds))
 
 
 def read_usage() -> Result:
@@ -340,7 +687,7 @@ def read_usage() -> Result:
         return Result(False, exc.message, None)
     except Exception:
         return Result(False, "usage unavailable", None)
-    return Result(True, format_line(usage.percent, usage.resets_at), usage.percent)
+    return Result(True, format_line(usage.percent, usage.resets_at), usage.percent, usage.resets_at)
 
 
 def bar_color(percent: float) -> str:
@@ -530,6 +877,8 @@ class UsageWidget(tk.Tk):
         self.title("Grok usage")
         self.configure(bg=BORDER)
         self.resizable(False, False)
+        with contextlib.suppress(tk.TclError):
+            self.attributes("-alpha", ALPHA)
 
         self._percent: float | None = None
         self._queue: queue.Queue = queue.Queue()
@@ -538,46 +887,40 @@ class UsageWidget(tk.Tk):
         self._timer: str | None = None
 
         family = pick_family(self)
-        self._font = tkfont.Font(family=family, size=12)
+        title_font = tkfont.Font(family=family, size=9, weight="bold")
+        row_font = tkfont.Font(family=family, size=10)
+        pct_font = tkfont.Font(family=family, size=10, weight="bold")
+        small_font = tkfont.Font(family=family, size=9)
 
         outer = tk.Frame(self, bg=BORDER, padx=1, pady=1)
         outer.pack(fill="both", expand=True)
-        inner = tk.Frame(outer, bg=BG, padx=12, pady=8)
+        inner = tk.Frame(outer, bg=BG, padx=PAD_X, pady=PAD_Y)
         inner.pack(fill="both", expand=True)
 
-        row = tk.Frame(inner, bg=BG)
-        row.pack(fill="x")
-        self.label = tk.Label(
-            row,
-            text="Grok …",
-            bg=BG,
-            fg=FG,
-            font=self._font,
-            anchor="w",
-            justify="left",
-        )
-        self.label.pack(side="left", fill="x", expand=True)
-        self.bar = tk.Canvas(
-            inner,
-            width=10,
-            height=8,
-            bg=BG,
-            highlightthickness=0,
-            bd=0,
-        )
-        self.bar.pack(fill="x", pady=(8, 0))
+        head = tk.Frame(inner, bg=BG)
+        head.pack(fill="x", pady=(0, 4))
+        tk.Label(head, text="●", bg=BG, fg=ACCENT, font=small_font).pack(side="left")
+        tk.Label(head, text="GROK", bg=BG, fg=FG, font=title_font).pack(side="left", padx=(4, 0))
+        self.updated = tk.Label(head, text="", bg=BG, fg=FG_MUTED, font=small_font)
+        self.updated.pack(side="right")
 
-        # Canvas defaults to about 10 cm wide, which would blow the window out.
-        # Size it from the longest status line instead.
-        text_w = max(
-            self._font.measure(EXPIRED_MSG),
-            self._font.measure("Grok 100% — resets Sep 30"),
-        ) + 8
-        self.label.configure(wraplength=text_w)
-        self.update_idletasks()
-        width = text_w + 12 * 2 + 2
-        height = max(self.winfo_reqheight(), 52)
-        self._place(width, height)
+        self.row = tk.Frame(inner, bg=BG)
+        self.row.pack(fill="x")
+        tk.Label(self.row, text="Week", bg=BG, fg=FG_DIM, font=row_font).pack(side="left")
+        self.pct = tk.Label(self.row, text="…", bg=BG, fg=FG, font=pct_font)
+        self.pct.pack(side="left", padx=(6, 0))
+        self.reset = tk.Label(self.row, text="", bg=BG, fg=FG_MUTED, font=small_font)
+        self.reset.pack(side="right")
+        self.error = tk.Label(
+            self.row, text="", bg=BG, fg=ERROR_FG, font=row_font, anchor="w", justify="left",
+            wraplength=CARD_W - PAD_X * 2 - 2,
+        )
+        self.bar = tk.Canvas(inner, height=BAR_H, bg=BG, highlightthickness=0, bd=0)
+        self.bar.pack(fill="x", pady=(3, 0))
+        self._row_widgets = [child for child in self.row.winfo_children() if child is not self.error]
+
+        self._panel = self._wait_for_taskbar()
+        self._sync_place()
         pin_to_desktop(self.winfo_id())
 
         self.bar.bind("<Configure>", lambda _event: self._draw_bar())
@@ -589,27 +932,43 @@ class UsageWidget(tk.Tk):
         self._arm_timer()
         self.after(150, self._poll)
         self.after(400, lambda: pin_to_desktop(self.winfo_id()))
+        self.after(PLACE_MS, self._place_tick)
 
-    def _place(self, width: int, height: int) -> None:
+    def _wait_for_taskbar(self):
+        """At login the panel may not have set its strut yet."""
         screen_w = self.winfo_screenwidth()
         screen_h = self.winfo_screenheight()
-        x, y = self._above_taskbar(width, height, screen_w, screen_h)
-        self.geometry(f"{width}x{height}+{x}+{y}")
-
-    @staticmethod
-    def _above_taskbar(width: int, height: int, screen_w: int, screen_h: int) -> tuple[int, int]:
         panel = bottom_taskbar(screen_w, screen_h)
         deadline = time.time() + 12
         while panel is None and time.time() < deadline:
             time.sleep(0.4)
             panel = bottom_taskbar(screen_w, screen_h)
+        return panel
+
+    def _sync_place(self) -> None:
+        if not self._alive:
+            return
+        self.update_idletasks()
+        height = self.winfo_reqheight()
+        screen_w = self.winfo_screenwidth()
+        screen_h = self.winfo_screenheight()
+        panel = self._panel
         if panel:
             panel_x, panel_y, panel_w, _panel_h = panel
-            x = panel_x + panel_w - width - 10
-            y = panel_y - height
-            x = min(max(x, panel_x), max(panel_x, panel_x + panel_w - width))
-            return max(0, x), max(0, y)
-        return max(0, screen_w - width - 16), max(0, screen_h - height - 8)
+            x = panel_x + panel_w - CARD_W - EDGE_GAP
+            y = panel_y - PANEL_GAP - height
+            x = min(max(x, panel_x), max(panel_x, panel_x + panel_w - CARD_W))
+        else:
+            x = screen_w - CARD_W - EDGE_GAP
+            y = screen_h - height - 8
+        self.geometry(f"{CARD_W}x{height}+{max(0, x)}+{max(0, y)}")
+
+    def _place_tick(self) -> None:
+        if not self._alive:
+            return
+        self._panel = bottom_taskbar(self.winfo_screenwidth(), self.winfo_screenheight()) or self._panel
+        self._sync_place()
+        self.after(PLACE_MS, self._place_tick)
 
     def _arm_timer(self, delay_ms: int = REFRESH_MS) -> None:
         if not self._alive:
@@ -650,12 +1009,32 @@ class UsageWidget(tk.Tk):
             self.apply(latest)
         self.after(200, self._poll)
 
+    def _show_error(self, error: bool) -> None:
+        for widget in self._row_widgets + [self.error]:
+            widget.pack_forget()
+        if error:
+            self.error.pack(side="left", fill="x", expand=True)
+            return
+        name, pct, reset = self._row_widgets
+        name.pack(side="left")
+        pct.pack(side="left", padx=(6, 0))
+        reset.pack(side="right")
+
     def apply(self, result: Result) -> None:
         text = result.text if isinstance(result.text, str) and result.text else "usage unavailable"
         percent = result.percent if isinstance(result.percent, (int, float)) and not isinstance(result.percent, bool) else None
         self._percent = float(percent) if percent is not None else None
-        self.label.configure(text=text, fg=FG if result.ok else "#ffd0cc")
+        if result.ok and self._percent is not None:
+            self.pct.configure(text=f"{format_percent(self._percent)}%", fg=bar_color(self._percent))
+            self.reset.configure(text=format_reset(result.resets_at))
+            self.updated.configure(text=datetime.now().strftime("%-I:%M%p").lower())
+            self._show_error(False)
+        else:
+            self.error.configure(text=text)
+            self.updated.configure(text="retrying")
+            self._show_error(True)
         self._draw_bar()
+        self._sync_place()
         # A fresh login does not restart the widget. Recheck quickly until it works.
         if not result.ok:
             self._arm_timer(RETRY_MS)
@@ -663,16 +1042,21 @@ class UsageWidget(tk.Tk):
     def _draw_bar(self) -> None:
         width = self.bar.winfo_width()
         height = self.bar.winfo_height()
-        if width < 2 or height < 2:
+        if width < height * 2 or height < 2:
             return
         self.bar.delete("all")
-        self.bar.create_rectangle(0, 0, width, height, fill=TRACK, width=0)
+        mid = height / 2
+        # A round-capped line is the cheapest rounded bar Tk can draw.
+        self.bar.create_line(mid, mid, width - mid, mid, width=height, fill=TRACK, capstyle="round")
         if self._percent is None:
             return
         fraction = max(0.0, min(self._percent, 100.0)) / 100.0
-        fill = int(round(width * fraction))
-        if fill > 0:
-            self.bar.create_rectangle(0, 0, fill, height, fill=bar_color(self._percent), width=0)
+        end = mid + (width - height) * fraction
+        if fraction > 0:
+            self.bar.create_line(
+                mid, mid, end, mid, width=height, fill=bar_color(self._percent), capstyle="round",
+            )
+
 
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)

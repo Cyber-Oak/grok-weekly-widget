@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=Claude usage
+Type=Application
+Exec=sh -c 'sleep 5; exec "$HOME/.local/bin/claude-usage-widget"'
+Terminal=false
+Comment=Claude Code usage widget, sits just above the Grok usage widget.
+Categories=Utility;
+StartupNotify=false

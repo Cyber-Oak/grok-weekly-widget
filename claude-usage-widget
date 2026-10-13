@@ -1,0 +1,1118 @@
+#!/usr/bin/env python3
+"""Desktop widget for Claude Code usage.
+
+Sits on the wallpaper like the Grok usage bar: no title bar, under other
+windows, fixed just above that bar. It starts with the session.
+
+Reads the Claude Code login in ~/.claude/.credentials.json. An access token
+inside five minutes of expiresAt is renewed with the stored refresh token,
+under the same ~/.claude/.oauth_refresh.lock directory Claude Code uses, and
+the new session is written back. Usage comes from the endpoint Claude Code's
+/usage view calls:
+
+    GET https://api.anthropic.com/api/oauth/usage
+
+The card shows the 5-hour session window and the 7-day window. Refreshes
+every 10 minutes.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import ctypes
+import ctypes.util
+import fcntl
+import json
+import os
+import queue
+import sys
+import tempfile
+import threading
+import time
+import tkinter as tk
+import tkinter.font as tkfont
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timedelta, timezone
+
+USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
+CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+OAUTH_BETA = "oauth-2025-04-20"
+API_VERSION = "2023-06-01"
+EXPIRED_MSG = "token expired, run claude to refresh"
+CHANGED_MSG = "usage data changed"
+REFRESH_MS = 10 * 60 * 1000
+RETRY_MS = 60 * 1000
+PLACE_MS = 15 * 1000
+REQUEST_TIMEOUT = 20
+MAX_BODY = 1_000_000
+EARLY_MS = 5 * 60 * 1000
+LOCK_STALE_S = 60
+# Card geometry is shared with grok-weekly-widget so the two stack as one
+# column: same width and right edge, a small gap above the taskbar.
+CARD_W = 261
+EDGE_GAP = 5
+PANEL_GAP = 6
+STACK_GAP = 6
+GROK_RESERVE = 78
+PAD_X = 12
+PAD_Y = 9
+ROW_GAP = 8
+BAR_H = 6
+ALPHA = 0.94
+
+BG = "#16171a"
+BORDER = "#2c2d33"
+FG = "#f4f4f5"
+FG_DIM = "#b4b4bd"
+FG_MUTED = "#7c7c87"
+TRACK = "#2a2b31"
+ACCENT = "#d97757"
+GREEN = "#3dd68c"
+AMBER = "#f5b942"
+RED = "#ff5d64"
+ERROR_FG = "#ffd0cc"
+
+MONTHS = (
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+)
+
+
+class UsageError(Exception):
+    def __init__(self, message: str, retry_ms: int | None = None) -> None:
+        super().__init__(message)
+        self.message = message
+        self.retry_ms = retry_ms
+
+
+class Credentials:
+    def __init__(
+        self,
+        token: str,
+        refresh_token: str | None,
+        expires_ms: int | None,
+        refresh_expires_ms: int | None,
+        scopes: list[str],
+        subscription_type: str | None,
+        rate_limit_tier: str | None,
+        client_id: str | None,
+    ) -> None:
+        self.token = token
+        self.refresh_token = refresh_token
+        self.expires_ms = expires_ms
+        self.refresh_expires_ms = refresh_expires_ms
+        self.scopes = scopes
+        self.subscription_type = subscription_type
+        self.rate_limit_tier = rate_limit_tier
+        self.client_id = client_id
+
+
+class WindowUsage:
+    def __init__(self, percent: float, resets_at: datetime | None) -> None:
+        self.percent = percent
+        self.resets_at = resets_at
+
+
+class Usage:
+    def __init__(self, session: WindowUsage | None, week: WindowUsage | None) -> None:
+        self.session = session
+        self.week = week
+
+
+class Result:
+    def __init__(
+        self,
+        ok: bool,
+        text: str,
+        session: WindowUsage | None,
+        week: WindowUsage | None,
+        retry_ms: int | None = None,
+    ) -> None:
+        self.ok = ok
+        self.text = text
+        self.session = session
+        self.week = week
+        self.retry_ms = retry_ms
+
+
+def creds_file() -> str:
+    override = os.environ.get("CLAUDE_CREDENTIALS_FILE")
+    if override:
+        return os.path.expanduser(override)
+    config = os.environ.get("CLAUDE_CONFIG_DIR")
+    if config:
+        return os.path.join(os.path.expanduser(config), ".credentials.json")
+    return os.path.expanduser("~/.claude/.credentials.json")
+
+
+def parse_time(value: object) -> datetime | None:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        stamp = float(value)
+        if stamp > 10_000_000_000:
+            stamp /= 1000.0
+        try:
+            return datetime.fromtimestamp(stamp, timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    dot = text.find(".")
+    if dot != -1:
+        end = dot + 1
+        while end < len(text) and text[end].isdigit():
+            end += 1
+        text = text[: dot + 1] + text[dot + 1 : end][:6] + text[end:]
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def header_value(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text or any(char in text for char in "\r\n\x00"):
+        return None
+    return text
+
+
+def as_number(value: object) -> float | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value.strip().rstrip("%"))
+        except ValueError:
+            return None
+    return None
+
+
+def token_needs_refresh(expires_ms: int | None, now_ms: int) -> bool:
+    if expires_ms is None:
+        return False
+    return expires_ms <= now_ms + EARLY_MS
+
+
+def load_credentials(path: str | None = None, now_ms: int | None = None) -> Credentials:
+    path = path or creds_file()
+    try:
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+    except FileNotFoundError as exc:
+        raise UsageError("not signed in, run claude") from exc
+    except (OSError, json.JSONDecodeError, UnicodeError) as exc:
+        raise UsageError("can't read login, run claude") from exc
+    if not isinstance(data, dict):
+        raise UsageError("can't read login, run claude")
+    entry = data.get("claudeAiOauth")
+    if not isinstance(entry, dict):
+        raise UsageError("not signed in, run claude")
+    token = header_value(entry.get("accessToken")) or ""
+    refresh = header_value(entry.get("refreshToken"))
+    expires = entry.get("expiresAt")
+    expires_ms = int(expires) if isinstance(expires, (int, float)) and not isinstance(expires, bool) else None
+    refresh_expires = entry.get("refreshTokenExpiresAt")
+    refresh_expires_ms = (
+        int(refresh_expires)
+        if isinstance(refresh_expires, (int, float)) and not isinstance(refresh_expires, bool)
+        else None
+    )
+    scopes = [item for item in entry.get("scopes", []) if isinstance(item, str) and item.strip()]
+    if not token and not refresh:
+        raise UsageError("not signed in, run claude")
+    now_ms = now_ms if now_ms is not None else int(time.time() * 1000)
+    sub = entry.get("subscriptionType")
+    tier = entry.get("rateLimitTier")
+    client = entry.get("clientId")
+    creds = Credentials(
+        token,
+        refresh,
+        expires_ms,
+        refresh_expires_ms,
+        scopes,
+        sub if isinstance(sub, str) else None,
+        tier if isinstance(tier, str) else None,
+        header_value(client),
+    )
+    creds.expired = (not token) or token_needs_refresh(expires_ms, now_ms)
+    return creds
+
+
+class _RefuseRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(req.full_url, code, msg, headers, fp)
+
+
+def allowed_url(value: str) -> str:
+    text = value.strip()
+    parsed = urllib.parse.urlparse(text)
+    host = (parsed.hostname or "").lower()
+    loopback = host in {"localhost", "127.0.0.1", "::1"}
+    if parsed.username or parsed.password or not parsed.netloc:
+        raise UsageError("can't reach Claude")
+    if parsed.scheme == "https" or (parsed.scheme == "http" and loopback):
+        return text
+    raise UsageError("can't reach Claude")
+
+
+def _read_body(response) -> bytes:
+    raw = response.read(MAX_BODY + 1)
+    if len(raw) > MAX_BODY:
+        raise UsageError("can't reach Claude")
+    return raw
+
+
+def _read_json(raw: bytes) -> dict:
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise UsageError("can't reach Claude") from exc
+    if not isinstance(payload, dict):
+        raise UsageError("can't reach Claude")
+    return payload
+
+
+def oauth_error_message(raw: bytes) -> str:
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError):
+        return "can't reach Claude"
+    if not isinstance(payload, dict):
+        return "can't reach Claude"
+    error = payload.get("error")
+    if isinstance(error, dict):
+        error = error.get("type") or error.get("message")
+    if error in {
+        "invalid_grant",
+        "invalid_client",
+        "unauthorized_client",
+        "invalid_token",
+        "access_denied",
+        "invalid_scope",
+    }:
+        return EXPIRED_MSG
+    return "can't reach Claude"
+
+
+def message_for_status(code: int) -> str:
+    if code in (401, 403):
+        return EXPIRED_MSG
+    if code in (301, 302, 303, 307, 308):
+        return "usage endpoint moved"
+    return "usage unavailable"
+
+
+@contextlib.contextmanager
+def oauth_refresh_lock(config_dir: str):
+    """Hold the directory lock Claude Code's refresh uses.
+
+    proper-lockfile creates ~/.claude/.oauth_refresh.lock with mkdir and
+    treats a quiet mtime as a live holder. A holder older than a minute is
+    stale. The refresh token only works once, so the token POST stays inside
+    this lock.
+    """
+    path = os.path.join(config_dir, ".oauth_refresh.lock")
+    deadline = time.monotonic() + 20
+    held = False
+    while time.monotonic() < deadline:
+        try:
+            os.mkdir(path, 0o700)
+            held = True
+            break
+        except FileExistsError:
+            try:
+                age = time.time() - os.stat(path).st_mtime
+            except FileNotFoundError:
+                continue
+            if age > LOCK_STALE_S:
+                try:
+                    os.rmdir(path)
+                except OSError:
+                    time.sleep(0.3)
+                continue
+            time.sleep(0.3)
+    if not held:
+        raise UsageError("usage unavailable")
+    try:
+        os.utime(path, None)
+        yield
+    finally:
+        try:
+            os.rmdir(path)
+        except OSError:
+            pass
+
+
+def atomic_write_json(path: str, data: object) -> None:
+    directory = os.path.dirname(path) or "."
+    fd, tmp = tempfile.mkstemp(prefix=".credentials-", suffix=".tmp", dir=directory)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
+def save_session(path: str, creds: Credentials, previous_refresh: str) -> None:
+    try:
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, json.JSONDecodeError, UnicodeError) as exc:
+        raise UsageError("can't read login, run claude") from exc
+    if not isinstance(data, dict) or not isinstance(data.get("claudeAiOauth"), dict):
+        raise UsageError("can't read login, run claude")
+    entry = data["claudeAiOauth"]
+    # Another writer won the refresh. Do not overwrite a newer refresh token.
+    current_refresh = header_value(entry.get("refreshToken"))
+    if current_refresh and current_refresh != previous_refresh and current_refresh != creds.refresh_token:
+        return
+    entry["accessToken"] = creds.token
+    if creds.refresh_token:
+        entry["refreshToken"] = creds.refresh_token
+    if creds.expires_ms is not None:
+        entry["expiresAt"] = creds.expires_ms
+    if creds.refresh_expires_ms is not None:
+        entry["refreshTokenExpiresAt"] = creds.refresh_expires_ms
+    if creds.scopes:
+        entry["scopes"] = creds.scopes
+    if creds.subscription_type:
+        entry["subscriptionType"] = creds.subscription_type
+    if creds.rate_limit_tier:
+        entry["rateLimitTier"] = creds.rate_limit_tier
+    if creds.client_id:
+        entry["clientId"] = creds.client_id
+    try:
+        atomic_write_json(path, data)
+    except OSError as exc:
+        raise UsageError("can't read login, run claude") from exc
+
+
+def exchange_refresh(creds: Credentials, now_ms: int) -> Credentials:
+    if not creds.refresh_token:
+        raise UsageError(EXPIRED_MSG)
+    scopes = creds.scopes or [
+        "user:profile",
+        "user:inference",
+        "user:sessions:claude_code",
+        "user:mcp_servers",
+        "user:file_upload",
+        "user:plugins",
+    ]
+    body = json.dumps(
+        {
+            "grant_type": "refresh_token",
+            "refresh_token": creds.refresh_token,
+            "client_id": creds.client_id or CLIENT_ID,
+            "scope": " ".join(scopes),
+        }
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        allowed_url(TOKEN_URL),
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "anthropic-beta": OAUTH_BETA,
+            "User-Agent": "claude-usage-widget",
+        },
+        method="POST",
+    )
+    opener = urllib.request.build_opener(_RefuseRedirect)
+    try:
+        with opener.open(request, timeout=REQUEST_TIMEOUT) as response:
+            payload = _read_json(_read_body(response))
+    except urllib.error.HTTPError as exc:
+        raw = exc.read(MAX_BODY + 1) if exc.fp else b""
+        raise UsageError(oauth_error_message(raw)) from exc
+    except UsageError:
+        raise
+    except Exception as exc:
+        raise UsageError("can't reach Claude") from exc
+    access = header_value(payload.get("access_token"))
+    if not access:
+        raise UsageError(EXPIRED_MSG)
+    refresh = header_value(payload.get("refresh_token")) or creds.refresh_token
+    expires_in = as_number(payload.get("expires_in"))
+    expires_ms = now_ms + int(expires_in * 1000) if expires_in and expires_in > 0 else now_ms + 3_600_000
+    refresh_in = as_number(payload.get("refresh_token_expires_in"))
+    refresh_expires_ms = (
+        now_ms + int(refresh_in * 1000) if refresh_in and refresh_in > 0 else creds.refresh_expires_ms
+    )
+    scope_text = payload.get("scope")
+    new_scopes = CUn(scope_text) if isinstance(scope_text, str) else creds.scopes
+    minted = Credentials(
+        access,
+        refresh,
+        expires_ms,
+        refresh_expires_ms,
+        new_scopes or creds.scopes,
+        creds.subscription_type,
+        creds.rate_limit_tier,
+        creds.client_id,
+    )
+    minted.expired = token_needs_refresh(expires_ms, now_ms)
+    return minted
+
+
+def CUn(scope: str) -> list[str]:
+    return [part for part in scope.split(" ") if part]
+
+
+def refresh_session(spent: Credentials, force: bool = False) -> Credentials:
+    path = creds_file()
+    config_dir = os.path.dirname(path) or "."
+    with oauth_refresh_lock(config_dir):
+        now_ms = int(time.time() * 1000)
+        current = load_credentials(path, now_ms)
+        if (
+            current.token
+            and not current.expired
+            and (not force or current.token != spent.token)
+        ):
+            return current
+        if not current.refresh_token:
+            raise UsageError(EXPIRED_MSG)
+        minted = exchange_refresh(current, now_ms)
+        save_session(path, minted, current.refresh_token)
+        return minted
+
+
+def http_get_usage(creds: Credentials, timeout: int = REQUEST_TIMEOUT) -> dict:
+    request = urllib.request.Request(
+        allowed_url(USAGE_URL),
+        headers={
+            "Authorization": "Bearer " + creds.token,
+            "anthropic-beta": OAUTH_BETA,
+            "anthropic-version": API_VERSION,
+            "Accept": "application/json",
+            "User-Agent": "claude-usage-widget",
+        },
+        method="GET",
+    )
+    opener = urllib.request.build_opener(_RefuseRedirect)
+    try:
+        with opener.open(request, timeout=timeout) as response:
+            raw = _read_body(response)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 429:
+            delay_s = 90
+            raw = exc.headers.get("Retry-After") if exc.headers else None
+            if isinstance(raw, str) and raw.strip().isdigit():
+                delay_s = int(raw.strip()) + 5
+            delay_s = max(60, min(delay_s, 15 * 60))
+            raise UsageError("usage unavailable", delay_s * 1000) from exc
+        raise UsageError(message_for_status(exc.code)) from exc
+    except UsageError:
+        raise
+    except Exception as exc:
+        raise UsageError("can't reach Claude") from exc
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise UsageError(CHANGED_MSG) from exc
+    if not isinstance(payload, dict):
+        raise UsageError(CHANGED_MSG)
+    return payload
+
+
+def window_from(container: object, percent_key: str = "utilization") -> WindowUsage | None:
+    if not isinstance(container, dict):
+        return None
+    percent = as_number(container.get(percent_key))
+    if percent is None:
+        percent = as_number(container.get("percent"))
+    if percent is None:
+        return None
+    return WindowUsage(percent, parse_time(container.get("resets_at")))
+
+
+def extract_usage(payload: dict) -> Usage:
+    session = window_from(payload.get("five_hour"))
+    week = window_from(payload.get("seven_day"))
+    if session is None or week is None:
+        limits = payload.get("limits")
+        if isinstance(limits, list):
+            for item in limits:
+                if not isinstance(item, dict):
+                    continue
+                kind = item.get("group") or item.get("kind")
+                found = window_from(item, "percent")
+                if found is None:
+                    continue
+                if session is None and kind == "session":
+                    session = found
+                elif week is None and kind == "weekly":
+                    week = found
+    if session is None and week is None:
+        raise UsageError(CHANGED_MSG)
+    return Usage(session, week)
+
+
+def format_percent(value: float) -> str:
+    rounded = round(float(value), 1)
+    if abs(rounded - round(rounded)) < 1e-9:
+        return str(int(round(rounded)))
+    return f"{rounded:.1f}"
+
+
+def format_reset(when: datetime) -> str:
+    local = when.astimezone()
+    # The usage service stamps the hour a fraction of a second early.
+    local = (local + timedelta(seconds=30)).replace(second=0, microsecond=0)
+    now = datetime.now(local.tzinfo)
+    if local - now <= timedelta(hours=18):
+        return local.strftime("%-I:%M%p").lower()
+    return f"{MONTHS[local.month - 1]} {local.day}"
+
+
+def format_window(kind: str, window: WindowUsage) -> str:
+    shown = format_percent(window.percent)
+    if window.resets_at is None:
+        return f"Claude {shown}% — {kind} not started"
+    return f"Claude {shown}% — {kind} {format_reset(window.resets_at)}"
+
+
+def format_usage(usage: Usage) -> str:
+    lines = []
+    if usage.session is not None:
+        lines.append(format_window("session", usage.session))
+    if usage.week is not None:
+        lines.append(format_window("week", usage.week))
+    return "\n".join(lines)
+
+
+def fetch_usage() -> Usage:
+    creds = load_credentials()
+    refreshed = False
+    if creds.expired or not creds.token:
+        creds = refresh_session(creds)
+        refreshed = True
+    try:
+        return extract_usage(http_get_usage(creds))
+    except UsageError as exc:
+        if exc.message != EXPIRED_MSG or refreshed:
+            raise
+        creds = refresh_session(creds, force=True)
+        return extract_usage(http_get_usage(creds))
+
+
+def read_usage() -> Result:
+    try:
+        usage = fetch_usage()
+    except UsageError as exc:
+        return Result(False, exc.message, None, None, exc.retry_ms)
+    except Exception:
+        return Result(False, "usage unavailable", None, None)
+    return Result(True, format_usage(usage), usage.session, usage.week)
+
+
+def bar_color(percent: float) -> str:
+    if percent >= 90:
+        return RED
+    if percent >= 70:
+        return AMBER
+    return GREEN
+
+
+def pick_family(root: tk.Misc) -> str:
+    families = set(tkfont.families(root))
+    for name in ("Nunito Sans", "Nunito", "DejaVu Sans", "Liberation Sans"):
+        if name in families:
+            return name
+    return tkfont.nametofont("TkDefaultFont").cget("family")
+
+
+def _load_x11():
+    libname = ctypes.util.find_library("X11")
+    if not libname:
+        return None
+    try:
+        x11 = ctypes.CDLL(libname)
+    except OSError:
+        return None
+    x11.XOpenDisplay.restype = ctypes.c_void_p
+    x11.XDefaultRootWindow.restype = ctypes.c_ulong
+    x11.XInternAtom.restype = ctypes.c_ulong
+    x11.XFree.argtypes = [ctypes.c_void_p]
+    x11.XGetWindowProperty.argtypes = [
+        ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong,
+        ctypes.c_long, ctypes.c_long, ctypes.c_int, ctypes.c_ulong,
+        ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(ctypes.c_int),
+        ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(ctypes.c_ulong),
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    x11.XGetGeometry.argtypes = [
+        ctypes.c_void_p, ctypes.c_ulong,
+        ctypes.POINTER(ctypes.c_ulong),
+        ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int),
+        ctypes.POINTER(ctypes.c_uint), ctypes.POINTER(ctypes.c_uint),
+        ctypes.POINTER(ctypes.c_uint), ctypes.POINTER(ctypes.c_uint),
+    ]
+    x11.XGetGeometry.restype = ctypes.c_int
+    x11.XTranslateCoordinates.argtypes = [
+        ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong,
+        ctypes.c_int, ctypes.c_int,
+        ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int),
+        ctypes.POINTER(ctypes.c_ulong),
+    ]
+    x11.XTranslateCoordinates.restype = ctypes.c_int
+    return x11
+
+
+def _x_cardinals(x11, display, window: int, name: str):
+    atom = x11.XInternAtom(display, name.encode(), False)
+    actual_type = ctypes.c_ulong()
+    actual_format = ctypes.c_int()
+    count = ctypes.c_ulong()
+    leftover = ctypes.c_ulong()
+    raw = ctypes.c_void_p()
+    status = x11.XGetWindowProperty(
+        display, window, atom, 0, 64, False, 0,
+        ctypes.byref(actual_type), ctypes.byref(actual_format),
+        ctypes.byref(count), ctypes.byref(leftover), ctypes.byref(raw),
+    )
+    if status != 0 or not raw or count.value == 0 or actual_format.value != 32:
+        if raw:
+            x11.XFree(raw)
+        return None
+    data = ctypes.cast(raw, ctypes.POINTER(ctypes.c_ulong))
+    values = [int(data[index]) for index in range(count.value)]
+    x11.XFree(raw)
+    return values
+
+
+def _x_text(x11, display, window: int, name: str) -> str | None:
+    atom = x11.XInternAtom(display, name.encode(), False)
+    actual_type = ctypes.c_ulong()
+    actual_format = ctypes.c_int()
+    count = ctypes.c_ulong()
+    leftover = ctypes.c_ulong()
+    raw = ctypes.c_void_p()
+    status = x11.XGetWindowProperty(
+        display, window, atom, 0, 256, False, 0,
+        ctypes.byref(actual_type), ctypes.byref(actual_format),
+        ctypes.byref(count), ctypes.byref(leftover), ctypes.byref(raw),
+    )
+    if status != 0 or not raw or count.value == 0 or actual_format.value != 8:
+        if raw:
+            x11.XFree(raw)
+        return None
+    text = ctypes.string_at(raw, count.value).split(b"\x00", 1)[0]
+    x11.XFree(raw)
+    try:
+        return text.decode("utf-8")
+    except UnicodeError:
+        return text.decode("latin-1", "replace")
+
+
+def bottom_taskbar(screen_w: int, screen_h: int):
+    x11 = _load_x11()
+    if x11 is None:
+        return None
+    display = x11.XOpenDisplay(None)
+    if not display:
+        return None
+    try:
+        root = x11.XDefaultRootWindow(display)
+        clients = _x_cardinals(x11, display, root, "_NET_CLIENT_LIST") or []
+        best = None
+        for window in clients:
+            strut = _x_cardinals(x11, display, window, "_NET_WM_STRUT_PARTIAL")
+            if not strut or len(strut) < 12 or strut[3] <= 0:
+                continue
+            start_x = strut[10]
+            end_x = strut[11]
+            if end_x < start_x:
+                continue
+            rect = (start_x, screen_h - int(strut[3]), end_x - start_x + 1, int(strut[3]))
+            if rect[2] <= 0 or rect[1] < 0 or rect[1] > screen_h:
+                continue
+            if best is None or rect[2] > best[2]:
+                best = rect
+        if best is None or best[0] >= screen_w or best[1] >= screen_h:
+            return None
+        return best
+    except Exception:
+        return None
+    finally:
+        x11.XCloseDisplay(display)
+
+
+def grok_window():
+    """Return (x, y, width, height) of the Grok usage window, or None."""
+    x11 = _load_x11()
+    if x11 is None:
+        return None
+    display = x11.XOpenDisplay(None)
+    if not display:
+        return None
+    try:
+        root = x11.XDefaultRootWindow(display)
+        clients = _x_cardinals(x11, display, root, "_NET_CLIENT_LIST") or []
+        for window in clients:
+            title = _x_text(x11, display, window, "_NET_WM_NAME")
+            if title != "Grok usage":
+                title = _x_text(x11, display, window, "WM_NAME")
+            if title != "Grok usage":
+                continue
+            root_ret = ctypes.c_ulong()
+            rx = ctypes.c_int()
+            ry = ctypes.c_int()
+            width = ctypes.c_uint()
+            height = ctypes.c_uint()
+            border = ctypes.c_uint()
+            depth = ctypes.c_uint()
+            if not x11.XGetGeometry(
+                display, window, ctypes.byref(root_ret),
+                ctypes.byref(rx), ctypes.byref(ry),
+                ctypes.byref(width), ctypes.byref(height),
+                ctypes.byref(border), ctypes.byref(depth),
+            ):
+                continue
+            abs_x = ctypes.c_int()
+            abs_y = ctypes.c_int()
+            child = ctypes.c_ulong()
+            if not x11.XTranslateCoordinates(
+                display, window, root, 0, 0,
+                ctypes.byref(abs_x), ctypes.byref(abs_y), ctypes.byref(child),
+            ):
+                continue
+            if width.value <= 0 or height.value <= 0:
+                continue
+            return int(abs_x.value), int(abs_y.value), int(width.value), int(height.value)
+        return None
+    except Exception:
+        return None
+    finally:
+        x11.XCloseDisplay(display)
+
+
+def _x_change(x11, display, window: int, prop: str, prop_type: int, data, count: int) -> None:
+    atom = x11.XInternAtom(display, prop.encode(), False)
+    x11.XChangeProperty(
+        display, window, atom, prop_type, 32, 0,
+        ctypes.cast(data, ctypes.POINTER(ctypes.c_ubyte)), count,
+    )
+
+
+def pin_to_desktop(window_id: int) -> None:
+    x11 = _load_x11()
+    if x11 is None:
+        return
+    x11.XQueryTree.restype = ctypes.c_int
+    x11.XQueryTree.argtypes = [
+        ctypes.c_void_p, ctypes.c_ulong,
+        ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(ctypes.c_ulong),
+        ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_uint),
+    ]
+    display = x11.XOpenDisplay(None)
+    if not display:
+        return
+    try:
+        root = x11.XDefaultRootWindow(display)
+        targets = [int(window_id)]
+        parent = ctypes.c_ulong()
+        root_ret = ctypes.c_ulong()
+        children = ctypes.c_void_p()
+        count = ctypes.c_uint()
+        if x11.XQueryTree(
+            display, int(window_id),
+            ctypes.byref(root_ret), ctypes.byref(parent),
+            ctypes.byref(children), ctypes.byref(count),
+        ):
+            if children:
+                x11.XFree(children)
+            parent_id = int(parent.value)
+            if parent_id and parent_id not in (int(root), int(window_id)):
+                targets.append(parent_id)
+
+        class MotifHints(ctypes.Structure):
+            _fields_ = [
+                ("flags", ctypes.c_ulong),
+                ("functions", ctypes.c_ulong),
+                ("decorations", ctypes.c_ulong),
+                ("input_mode", ctypes.c_long),
+                ("status", ctypes.c_ulong),
+            ]
+
+        hints = MotifHints(2, 0, 0, 0, 0)
+        states = (ctypes.c_ulong * 4)(*(
+            x11.XInternAtom(display, name.encode(), False)
+            for name in (
+                "_NET_WM_STATE_BELOW",
+                "_NET_WM_STATE_SKIP_TASKBAR",
+                "_NET_WM_STATE_SKIP_PAGER",
+                "_NET_WM_STATE_STICKY",
+            )
+        ))
+        normal = (ctypes.c_ulong * 1)(x11.XInternAtom(display, b"_NET_WM_WINDOW_TYPE_NORMAL", False))
+        xa_atom = 4
+        motif = x11.XInternAtom(display, b"_MOTIF_WM_HINTS", False)
+        for target in targets:
+            _x_change(x11, display, target, "_MOTIF_WM_HINTS", motif, ctypes.byref(hints), 5)
+            _x_change(x11, display, target, "_NET_WM_STATE", xa_atom, states, 4)
+            _x_change(x11, display, target, "_NET_WM_WINDOW_TYPE", xa_atom, normal, 1)
+        x11.XFlush(display)
+    except Exception:
+        return
+    finally:
+        x11.XCloseDisplay(display)
+
+
+class Row:
+    """One usage window: name and percent left, reset time right, bar below."""
+
+    def __init__(self, parent: tk.Misc, name: str, fonts: dict) -> None:
+        self.percent: float | None = None
+        self.frame = tk.Frame(parent, bg=BG)
+        head = tk.Frame(self.frame, bg=BG)
+        head.pack(fill="x")
+        tk.Label(head, text=name, bg=BG, fg=FG_DIM, font=fonts["row"]).pack(side="left")
+        self.pct = tk.Label(head, text="…", bg=BG, fg=FG, font=fonts["pct"])
+        self.pct.pack(side="left", padx=(6, 0))
+        self.reset = tk.Label(head, text="", bg=BG, fg=FG_MUTED, font=fonts["small"])
+        self.reset.pack(side="right")
+        self.bar = tk.Canvas(self.frame, height=BAR_H, bg=BG, highlightthickness=0, bd=0)
+        self.bar.pack(fill="x", pady=(3, 0))
+        self.bar.bind("<Configure>", lambda _event: self.draw())
+
+    def set(self, window: WindowUsage, idle_text: str) -> None:
+        self.percent = window.percent
+        self.pct.configure(text=f"{format_percent(window.percent)}%", fg=bar_color(window.percent))
+        if window.resets_at is None:
+            self.reset.configure(text=idle_text)
+        else:
+            self.reset.configure(text=f"resets {format_reset(window.resets_at)}")
+        self.draw()
+
+    def draw(self) -> None:
+        draw_bar(self.bar, self.percent)
+
+
+def draw_bar(canvas: tk.Canvas, percent: float | None) -> None:
+    width = canvas.winfo_width()
+    height = canvas.winfo_height()
+    if width < height * 2 or height < 2:
+        return
+    canvas.delete("all")
+    mid = height / 2
+    # A round-capped line is the cheapest rounded bar Tk can draw.
+    canvas.create_line(mid, mid, width - mid, mid, width=height, fill=TRACK, capstyle="round")
+    if percent is None:
+        return
+    fraction = max(0.0, min(percent, 100.0)) / 100.0
+    end = mid + (width - height) * fraction
+    if fraction > 0:
+        canvas.create_line(mid, mid, end, mid, width=height, fill=bar_color(percent), capstyle="round")
+
+
+class UsageWidget(tk.Tk):
+    def __init__(self) -> None:
+        super().__init__()
+        self.title("Claude usage")
+        self.configure(bg=BORDER)
+        self.resizable(False, False)
+        with contextlib.suppress(tk.TclError):
+            self.attributes("-alpha", ALPHA)
+
+        self._queue: queue.Queue = queue.Queue()
+        self._lock = threading.Lock()
+        self._alive = True
+        self._timer: str | None = None
+        self._height = 0
+
+        family = pick_family(self)
+        fonts = {
+            "title": tkfont.Font(family=family, size=9, weight="bold"),
+            "row": tkfont.Font(family=family, size=10),
+            "pct": tkfont.Font(family=family, size=10, weight="bold"),
+            "small": tkfont.Font(family=family, size=9),
+        }
+
+        outer = tk.Frame(self, bg=BORDER, padx=1, pady=1)
+        outer.pack(fill="both", expand=True)
+        self.inner = tk.Frame(outer, bg=BG, padx=PAD_X, pady=PAD_Y)
+        self.inner.pack(fill="both", expand=True)
+
+        head = tk.Frame(self.inner, bg=BG)
+        head.pack(fill="x", pady=(0, 4))
+        tk.Label(head, text="●", bg=BG, fg=ACCENT, font=fonts["small"]).pack(side="left")
+        tk.Label(head, text="CLAUDE", bg=BG, fg=FG, font=fonts["title"]).pack(side="left", padx=(4, 0))
+        self.updated = tk.Label(head, text="", bg=BG, fg=FG_MUTED, font=fonts["small"])
+        self.updated.pack(side="right")
+
+        self.error = tk.Label(
+            self.inner, text="", bg=BG, fg=ERROR_FG, font=fonts["row"], anchor="w", justify="left",
+            wraplength=CARD_W - PAD_X * 2 - 2,
+        )
+        self.session = Row(self.inner, "Session", fonts)
+        self.week = Row(self.inner, "Week", fonts)
+        self._show(session=True, week=True)
+        self._sync_place()
+        pin_to_desktop(self.winfo_id())
+
+        self.protocol("WM_DELETE_WINDOW", lambda: None)
+
+        self.refresh_now()
+        self._arm_timer()
+        self.after(150, self._poll)
+        self.after(400, lambda: pin_to_desktop(self.winfo_id()))
+        self.after(800, self._sync_place)
+        self.after(PLACE_MS, self._place_tick)
+
+    def _show(self, session: bool, week: bool, error: bool = False) -> None:
+        for widget in (self.error, self.session.frame, self.week.frame):
+            widget.pack_forget()
+        if error:
+            self.error.pack(fill="x")
+        if session:
+            self.session.frame.pack(fill="x")
+        if week:
+            self.week.frame.pack(fill="x", pady=(ROW_GAP, 0) if session else (0, 0))
+
+    def _sync_place(self) -> None:
+        if not self._alive:
+            return
+        self.update_idletasks()
+        self._height = self.winfo_reqheight()
+        screen_w = self.winfo_screenwidth()
+        screen_h = self.winfo_screenheight()
+        x, y = self._above_grok(CARD_W, self._height, screen_w, screen_h)
+        self.geometry(f"{CARD_W}x{self._height}+{x}+{y}")
+
+    @staticmethod
+    def _above_grok(width: int, height: int, screen_w: int, screen_h: int) -> tuple[int, int]:
+        grok = grok_window()
+        if grok:
+            gx, gy, gw, _gh = grok
+            x = gx + gw - width
+            y = gy - height - STACK_GAP
+            return max(0, x), max(0, y)
+        panel = bottom_taskbar(screen_w, screen_h)
+        if panel:
+            panel_x, panel_y, panel_w, _panel_h = panel
+            x = panel_x + panel_w - width - EDGE_GAP
+            y = panel_y - PANEL_GAP - GROK_RESERVE - STACK_GAP - height
+            x = min(max(x, panel_x), max(panel_x, panel_x + panel_w - width))
+            return max(0, x), max(0, y)
+        return max(0, screen_w - width - EDGE_GAP), max(0, screen_h - height - GROK_RESERVE - 12)
+
+    def _arm_timer(self, delay_ms: int = REFRESH_MS) -> None:
+        if not self._alive:
+            return
+        if self._timer is not None:
+            self.after_cancel(self._timer)
+            self._timer = None
+        self._timer = self.after(delay_ms, self._on_timer)
+
+    def _on_timer(self) -> None:
+        self._timer = None
+        self.refresh_now()
+        self._arm_timer()
+
+    def _place_tick(self) -> None:
+        if not self._alive:
+            return
+        self._sync_place()
+        self.after(PLACE_MS, self._place_tick)
+
+    def refresh_now(self) -> None:
+        if not self._alive:
+            return
+        if not self._lock.acquire(blocking=False):
+            return
+        threading.Thread(target=self._worker, daemon=True).start()
+
+    def _worker(self) -> None:
+        try:
+            self._queue.put(read_usage())
+        finally:
+            self._lock.release()
+
+    def _poll(self) -> None:
+        if not self._alive:
+            return
+        latest = None
+        try:
+            while True:
+                latest = self._queue.get_nowait()
+        except queue.Empty:
+            pass
+        if latest is not None:
+            self.apply(latest)
+        self.after(200, self._poll)
+
+    def apply(self, result: Result) -> None:
+        if not result.ok:
+            text = result.text if isinstance(result.text, str) and result.text else "usage unavailable"
+            self.error.configure(text=text)
+            self.updated.configure(text="retrying")
+            self._show(session=False, week=False, error=True)
+            self._sync_place()
+            self._arm_timer(result.retry_ms or RETRY_MS)
+            return
+        if result.session:
+            self.session.set(result.session, "not started")
+        if result.week:
+            self.week.set(result.week, "")
+        self.updated.configure(text=datetime.now().strftime("%-I:%M%p").lower())
+        self._show(session=result.session is not None, week=result.week is not None)
+        self._sync_place()
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = list(sys.argv[1:] if argv is None else argv)
+    if args == ["--once"]:
+        result = read_usage()
+        print(result.text)
+        return 0 if result.ok else 1
+    if args:
+        print("usage: claude-usage-widget [--once]", file=sys.stderr)
+        return 2
+    os.makedirs(os.path.expanduser("~/.cache"), mode=0o700, exist_ok=True)
+    lock_path = os.path.expanduser("~/.cache/claude-usage-widget.lock")
+    lock_file = open(lock_path, "a", encoding="utf-8")
+    try:
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print("claude-usage-widget is already running", file=sys.stderr)
+        return 0
+    try:
+        widget = UsageWidget()
+    except tk.TclError as exc:
+        print(f"can't open a window: {exc}", file=sys.stderr)
+        return 1
+    widget.mainloop()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
